@@ -387,7 +387,7 @@ public:
     Inst *True = IC.getConst(APInt(1, 1, false));
 
     for (unsigned I=2; I<=W; I++) {
-      Inst *ShiftAmt = IC.getConst(APInt(W, W-I, false));
+      Inst *ShiftAmt = IC.getConst(APInt((unsigned int)W, (uint64_t) (W-I), false));
       Inst *Res = IC.getInst(Inst::AShr, W, {LHS, ShiftAmt});
       Inst *Guess1 = IC.getInst(Inst::Eq, 1, {Res, IC.getConst(APInt(W, 0, false))});
       Inst *Guess2 = IC.getInst(Inst::Eq, 1, {Res, IC.getConst(APInt::getAllOnesValue(W))});

@@ -273,9 +273,9 @@ set(SOUPER_TOOL_FILES
   include/souper/Tool/GetSolver.h.in
 )
 
-#add_library(souperTool STATIC
-#  ${SOUPER_TOOL_FILES}
-#)
+add_library(souperTool STATIC
+  ${SOUPER_TOOL_FILES}
+)
 
 set(SOUPER_CODEGEN_FILES
   lib/Codegen/Codegen.cpp
@@ -303,11 +303,11 @@ set(SOUPER_SOURCES
 #  lib/Pass/Pass.cpp
 #)
 
-#add_library(souperPassStatic STATIC
-#  ${KLEE_EXPR_FILES}
-#  ${SOUPER_SOURCES}
-#  lib/Pass/Pass.cpp
-#)
+add_library(souperPassStatic STATIC
+  ${KLEE_EXPR_FILES}
+  ${SOUPER_SOURCES}
+  lib/Pass/Pass.cpp
+)
 
 #add_library(souperPassProfileAll SHARED
 #  ${KLEE_EXPR_FILES}
@@ -417,7 +417,7 @@ configure_file(
 
 foreach(target souperExtractor souperInfer souperInst souperKVStore souperParser
                souperSMTLIB2 kleeExpr
-               souperCodegen souperCodegenStatic)
+               souperCodegen souperCodegenStatic souperPassStatic souperTool)
   set_target_properties(${target} PROPERTIES COMPILE_FLAGS "${LLVM_CXXFLAGS}")
   target_include_directories(${target} PRIVATE "${LLVM_INCLUDEDIR}")
 endforeach()
@@ -439,7 +439,7 @@ target_link_libraries(souperInst ${LLVM_LIBS} ${LLVM_LDFLAGS})
 target_link_libraries(souperKVStore ${HIREDIS_LIBRARY} ${LLVM_LIBS} ${LLVM_LDFLAGS})
 target_link_libraries(souperParser souperInst ${LLVM_LIBS} ${LLVM_LDFLAGS} ${ALIVE_LIBRARY})
 target_link_libraries(souperSMTLIB2 ${LLVM_LIBS} ${LLVM_LDFLAGS})
-#target_link_libraries(souperTool souperExtractor souperSMTLIB2)
+target_link_libraries(souperTool souperExtractor souperSMTLIB2)
 target_link_libraries(souperCodegen ${LLVM_LIBS} ${LLVM_LDFLAGS})
 
 # dynamic

@@ -14,6 +14,7 @@
 
 #define DEBUG_TYPE "souper"
 
+#include "souper/SMTLIB2/Solver.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
@@ -22,23 +23,22 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/raw_ostream.h"
-#include "souper/SMTLIB2/Solver.h"
 #include <fcntl.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <system_error>
 
-#ifdef _WIN32 
-#include<time.h> 
-#include<io.h> 
-#define STDIN_FILENO 0 
-#define STDOUT_FILENO 1 
-#define STDERR_FILENO 2 
-#else 
-#include<sys / resource.h> 
-#include<sys / time.h> 
-#include<unistd.h> +
+#ifdef _WIN32
+#include <io.h>
+#include <time.h>
+#define STDIN_FILENO 0
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
+#else
+#include <sys / resource.h>
+#include <sys / time.h>
+#include <unistd.h> +
 #endif
 
 using namespace llvm;
@@ -145,7 +145,7 @@ struct SMTLIBParser {
 
     unsigned Width = WidthChar - '0';
     while (Begin != End && *Begin >= '0' && *Begin <= '9')
-      Width = Width*10 + (*Begin++ - '0');
+      Width = Width * 10 + (*Begin++ - '0');
 
     if (!consumeExpected(')', ErrStr))
       return APInt();
@@ -157,13 +157,13 @@ struct SMTLIBParser {
     ErrStr.clear();
     const char *NumBegin = Begin;
     while (Begin != End && ((*Begin >= '0' && *Begin <= '9') ||
-           (*Begin >= 'a' && *Begin <= 'f') ||
-           (*Begin >= 'A' && *Begin <= 'F')))
+                            (*Begin >= 'a' && *Begin <= 'f') ||
+                            (*Begin >= 'A' && *Begin <= 'F')))
       ++Begin;
     const char *NumEnd = Begin;
     unsigned Width = NumEnd - NumBegin;
 
-    return APInt(Width*4, StringRef(NumBegin, Width), 16);
+    return APInt(Width * 4, StringRef(NumBegin, Width), 16);
   }
 
   APInt parseModel(std::string &ErrStr) {
@@ -226,9 +226,7 @@ public:
     ArgPtrs.push_back(0);
   }
 
-  std::string getName() const override {
-    return Name;
-  }
+  std::string getName() const override { return Name; }
 
   std::error_code isSatisfiable(StringRef Query, bool &Result,
                                 unsigned NumModels, std::vector<APInt> *Models,
@@ -247,26 +245,34 @@ public:
 
     int OutputFD;
     SmallString<64> OutputPath;
-    if (std::error_code EC =
-            sys::fs::createTemporaryFile("output", "out", OutputFD,
-                                         OutputPath)) {
+    if (std::error_code EC = sys::fs::createTemporaryFile(
+            "output", "out", OutputFD, OutputPath)) {
       ++Errors;
       return EC;
     }
-#ifndef _WIN32
-    ::close(OutputFD);
-#else
-    _close(OutputFD);
-#endif
 
-    int ExitCode =
-        Prog(Args, InputPath, OutputPath, /*ErrorPath=*/"/dev/null", Timeout);
+    ::close(OutputFD);
+
+    int ErrFD;
+    SmallString<64> ErrPath;
+    if (std::error_code EC =
+            sys::fs::createTemporaryFile("output", "out", ErrFD, ErrPath)) {
+      ++Errors;
+      return EC;
+    }
+
+    ::close(ErrFD);
+
+    int ExitCode = Prog(Args, InputPath, OutputPath, ErrPath, Timeout);
 
     if (Keep) {
       llvm::errs() << "Solver input saved to " << InputPath << '\n';
     } else {
       ::remove(InputPath.c_str());
     }
+
+    // Clean err
+    ::remove(ErrPath.c_str());
 
     switch (ExitCode) {
     case -2:
@@ -288,6 +294,14 @@ public:
         return EC;
       }
 
+      // Replace \r\n with \n
+#ifdef _WIN32
+      std::string Output = (*MB)->getBuffer().str();
+      Output.erase(std::remove(Output.begin(), Output.end(), '\r'),
+          				   Output.end());
+      *MB = MemoryBuffer::getMemBufferCopy(Output);
+#endif
+      
       if ((*MB)->getBuffer().startswith("sat\n")) {
         ::remove(OutputPath.c_str());
         Result = true;
@@ -313,10 +327,9 @@ public:
     }
     }
   }
-
 };
 
-}
+} // namespace
 
 SolverProgram souper::makeExternalSolverProgram(StringRef Path) {
   std::string PathStr = Path.str();
@@ -326,8 +339,10 @@ SolverProgram souper::makeExternalSolverProgram(StringRef Path) {
     std::vector<StringRef> ArgPtrs;
     ArgPtrs.push_back(PathStr);
     ArgPtrs.insert(ArgPtrs.end(), Args.begin(), Args.end());
-    std::optional<StringRef> Redirects[] = {RedirectIn, RedirectOut, RedirectErr};
-    return sys::ExecuteAndWait(PathStr, ArgPtrs, std::nullopt, Redirects, Timeout);
+    std::optional<StringRef> Redirects[] = {RedirectIn, RedirectOut,
+                                            RedirectErr};
+    return sys::ExecuteAndWait(PathStr, ArgPtrs, std::nullopt, Redirects,
+                               Timeout);
   };
 }
 
@@ -344,22 +359,29 @@ SolverProgram souper::makeInternalSolverProgram(int MainPtr(int argc,
     if (pid == 0) {
 #ifndef _WIN32
       int InFD = open(RedirectIn.str().c_str(), O_RDONLY);
-      if (InFD == -1) _exit(1);
+      if (InFD == -1)
+        _exit(1);
       int OutFD = open(RedirectOut.str().c_str(), O_WRONLY);
-      if (OutFD == -1) _exit(1);
+      if (OutFD == -1)
+        _exit(1);
       int ErrFD = open(RedirectErr.str().c_str(), O_WRONLY);
-      if (ErrFD == -1) _exit(1);
+      if (ErrFD == -1)
+        _exit(1);
 
       close(STDIN_FILENO);
       close(STDOUT_FILENO);
       close(STDERR_FILENO);
 
-      if (dup2(InFD, STDIN_FILENO) == -1) _exit(1);
-      if (dup2(OutFD, STDOUT_FILENO) == -1) _exit(1);
-      if (dup2(ErrFD, STDERR_FILENO) == -1) _exit(1);
+      if (dup2(InFD, STDIN_FILENO) == -1)
+        _exit(1);
+      if (dup2(OutFD, STDOUT_FILENO) == -1)
+        _exit(1);
+      if (dup2(ErrFD, STDERR_FILENO) == -1)
+        _exit(1);
 
       rlimit rlim;
-      if (getrlimit(RLIMIT_NOFILE, &rlim) == -1) _exit(1);
+      if (getrlimit(RLIMIT_NOFILE, &rlim) == -1)
+        _exit(1);
 
       for (unsigned fd = 3; fd != rlim.rlim_cur; ++fd) {
         close(fd);

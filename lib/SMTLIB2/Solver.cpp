@@ -36,8 +36,8 @@
 #define STDOUT_FILENO 1
 #define STDERR_FILENO 2
 #else
-#include <sys / resource.h>
-#include <sys / time.h>
+#include <sys/resource.h>
+#include <sys/time.h>
 #include <unistd.h> +
 #endif
 

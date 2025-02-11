@@ -14,7 +14,7 @@ endif()
 if(WIN32)
   set(LLVM_CONFIG_EXECUTABLE ${TOB_FOLDER}/llvm/bin/llvm-config.exe)
 else()
-  set(LLVM_CONFIG_EXECUTABLE ${TOB_FOLDER}/llvm/bin/llvm-config)
+  set(LLVM_CONFIG_EXECUTABLE ${LLVM_FOLDER}/bin/llvm-config)
 endif()
 if(NOT EXISTS ${LLVM_CONFIG_EXECUTABLE})
   message(FATAL_ERROR "llvm-config could not be found!")
@@ -279,7 +279,6 @@ add_library(souperTool STATIC
 
 set(SOUPER_CODEGEN_FILES
   lib/Codegen/Codegen.cpp
-  lib/Codegen/MachineCost.cpp
   include/souper/Codegen/Codegen.h
 )
 

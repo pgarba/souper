@@ -15,11 +15,15 @@
 #ifndef SOUPER_UTIL_LLVMUTILS_H
 #define SOUPER_UTIL_LLVMUTILS_H
 
+#include "llvm/ADT/SmallString.h"
+
 namespace souper {
 
   std::string inline getPaddedBinaryString(llvm::APInt Result) {
     auto W = Result.getBitWidth();
-    auto Str = toString(Result, 2, false);
+    llvm::SmallString<64> S;
+    Result.toString(S, 2, false);
+    std::string Str(S);
     while (Str.length() < W) {
       Str = "0" + Str;
     }

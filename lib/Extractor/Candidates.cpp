@@ -13,22 +13,25 @@
 // limitations under the License.
 
 #include "souper/Extractor/Candidates.h"
-
 #include "llvm/ADT/EquivalenceClasses.h"
+#include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/GetElementPtrTypeIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
-#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/KnownBits.h"
 #include "souper/Inst/Inst.h"
@@ -52,6 +55,10 @@ static llvm::cl::opt<bool> HarvestUses(
     "souper-harvest-uses",
     llvm::cl::desc("Harvest operands (default=false)"),
     llvm::cl::init(false));
+static llvm::cl::opt<bool> MarkExternalUses(
+    "souper-mark-external-uses",
+    llvm::cl::desc("Mark external uses in harvesting (default=true)"),
+    llvm::cl::init(true));
 static llvm::cl::opt<bool> PrintNegAtReturn(
     "print-neg-at-return",
     llvm::cl::desc("Print negative dfa in each value returned from a function (default=false)"),
@@ -84,6 +91,10 @@ static llvm::cl::opt<bool> PrintDemandedBitsAtReturn(
     "print-demanded-bits-from-harvester",
     llvm::cl::desc("Print demanded bits (default=false)"),
     llvm::cl::init(false));
+static llvm::cl::opt<bool> ExtractPhi(
+    "extract-phi",
+    llvm::cl::desc("Follow PHI nodes when extracting from LLVM (default=true)"),
+    llvm::cl::init(true));
 
 extern bool UseAlive;
 
@@ -128,19 +139,19 @@ void CandidateReplacement::print(llvm::raw_ostream &Out,
 namespace {
 
 struct ExprBuilder {
-  ExprBuilder(const ExprBuilderOptions &Opts, Module *M, const LoopInfo *LI,
-              DemandedBits *DB, LazyValueInfo *LVI, ScalarEvolution *SE,
-              TargetLibraryInfo * TLI, InstContext &IC,
+  ExprBuilder(const ExprBuilderOptions &Opts, Module *M, const LoopInfo &LI,
+              DemandedBits &DB, LazyValueInfo &LVI, ScalarEvolution &SE,
+              TargetLibraryInfo &TLI, InstContext &IC,
               ExprBuilderContext &EBC)
     : Opts(Opts), DL(M->getDataLayout()), LI(LI), DB(DB), LVI(LVI), SE(SE), TLI(TLI), IC(IC), EBC(EBC) {}
 
   const ExprBuilderOptions &Opts;
   const DataLayout &DL;
-  const LoopInfo *LI;
-  DemandedBits *DB;
-  LazyValueInfo *LVI;
-  ScalarEvolution *SE;
-  TargetLibraryInfo *TLI;
+  const LoopInfo &LI;
+  DemandedBits &DB;
+  LazyValueInfo &LVI;
+  ScalarEvolution &SE;
+  TargetLibraryInfo &TLI;
   InstContext &IC;
   ExprBuilderContext &EBC;
 
@@ -198,7 +209,7 @@ bool ExprBuilder::isLoopEntryPoint(PHINode *Phi) {
   BasicBlock *BB = Phi->getParent();
   // If LLVM can determine if BB is a loop header, simply return true.
   // Presumably, this should handle structured loops.
-  if (LI->isLoopHeader(BB))
+  if (LI.isLoopHeader(BB))
     return true;
   if (Phi->getNumIncomingValues() <= 1)
     return false;
@@ -235,10 +246,10 @@ Inst *ExprBuilder::makeArrayRead(Value *V) {
         // with this approach, we might be restricting the constant
         // range harvesting. Because range info. might be coming from
         // llvm values other than instruction.
-        auto LVIRange = LVI->getConstantRange(V, I);
-        auto SC = SE->getSCEV(V);
-        auto R1 = LVIRange.intersectWith(SE->getSignedRange(SC));
-        auto R2 = LVIRange.intersectWith(SE->getUnsignedRange(SC));
+        auto LVIRange = LVI.getConstantRange(V, I, /*UndefAllowed=*/false);
+        auto SC = SE.getSCEV(V);
+        auto R1 = LVIRange.intersectWith(SE.getSignedRange(SC));
+        auto R2 = LVIRange.intersectWith(SE.getUnsignedRange(SC));
         Range = getSetSize(R1).ult(getSetSize(R2)) ? R1 : R2;
       }
     }
@@ -246,7 +257,7 @@ Inst *ExprBuilder::makeArrayRead(Value *V) {
 
   return IC.createVar(Width, Name, Range, Known.Zero, Known.One, NonZero, NonNegative,
                       PowOfTwo, Negative, NumSignBits,
-                      llvm::APInt::getAllOnesValue(Width), 0);
+                      llvm::APInt::getAllOnes(Width), 0);
 }
 
 Inst *ExprBuilder::buildConstant(Constant *c) {
@@ -507,6 +518,9 @@ Inst *ExprBuilder::buildHelper(Value *V) {
     if (UseAlive) { // FIXME: Remove this after alive supports phi
       return makeArrayRead(V);
     }
+    if (!ExtractPhi) {
+      return makeArrayRead(V);
+    }
     if (!isLoopEntryPoint(Phi)) {
       BasicBlock *BB = Phi->getParent();
       BlockInfo &BI = EBC.BlockMap[BB];
@@ -623,7 +637,7 @@ Inst *ExprBuilder::buildHelper(Value *V) {
       }
     } else {
       Function* F = Call->getCalledFunction();
-      if(F && TLI->getLibFunc(*F, Func) && TLI->has(Func)) {
+      if(F && TLI.getLibFunc(*F, Func) && TLI.has(Func)) {
         switch (Func) {
           case LibFunc_abs: {
             Inst *A = get(Call->getOperand(0));
@@ -655,7 +669,7 @@ Inst *ExprBuilder::get(Value *V, APInt DemandedBits) {
 Inst *ExprBuilder::getFromUse(Value *V) {
   // Do not find from cache
   unsigned Width = DL.getTypeSizeInBits(V->getType());
-  APInt DemandedBits = APInt::getAllOnesValue(Width);
+  APInt DemandedBits = APInt::getAllOnes(Width);
   Inst *E = build(V, DemandedBits);
   if (E->K != Inst::Const && !E->hasOrigin(V))
     E->Origins.push_back(V);
@@ -667,7 +681,7 @@ Inst *ExprBuilder::get(Value *V) {
   Inst *&E = EBC.InstMap[V];
   if (!E) {
     unsigned Width = DL.getTypeSizeInBits(V->getType());
-    APInt DemandedBits = APInt::getAllOnesValue(Width);
+    APInt DemandedBits = APInt::getAllOnes(Width);
     E = build(V, DemandedBits);
   }
   if (E->K != Inst::Const && !E->hasOrigin(V))
@@ -890,8 +904,8 @@ std::string convertBoolToStr(bool b) {
   return b ? "true" : "false";
 }
 
-void PrintDataflowInfo(Function &F, Instruction &I, LazyValueInfo *LVI,
-                       ScalarEvolution *SE) {
+void PrintDataflowInfo(Function &F, Instruction &I, LazyValueInfo &LVI,
+                       ScalarEvolution &SE) {
   if (I.getNumOperands() == 0) {
     return;
   }
@@ -933,10 +947,10 @@ void PrintDataflowInfo(Function &F, Instruction &I, LazyValueInfo *LVI,
     ConstantRange Range = llvm::ConstantRange(Width, /*isFullSet=*/true);
     if (V->getType()->isIntegerTy()) {
       if (Instruction *I = dyn_cast<Instruction>(V)) {
-        auto LVIRange = LVI->getConstantRange(V, I);
-        auto SC = SE->getSCEV(V);
-        auto R1 = LVIRange.intersectWith(SE->getSignedRange(SC));
-        auto R2 = LVIRange.intersectWith(SE->getUnsignedRange(SC));
+        auto LVIRange = LVI.getConstantRange(V, I, /*UndefAllowed=*/false);
+        auto SC = SE.getSCEV(V);
+        auto R1 = LVIRange.intersectWith(SE.getSignedRange(SC));
+        auto R2 = LVIRange.intersectWith(SE.getUnsignedRange(SC));
         Range = getSetSize(R1).ult(getSetSize(R2)) ? R1 : R2;
       }
     }
@@ -945,9 +959,9 @@ void PrintDataflowInfo(Function &F, Instruction &I, LazyValueInfo *LVI,
   }
 }
 
-void ExtractExprCandidates(Function &F, const LoopInfo *LI, DemandedBits *DB,
-                           LazyValueInfo *LVI, ScalarEvolution *SE,
-                           TargetLibraryInfo *TLI,
+void ExtractExprCandidates(Function &F, const LoopInfo &LI, DemandedBits &DB,
+                           LazyValueInfo &LVI, ScalarEvolution &SE,
+                           TargetLibraryInfo &TLI,
                            const ExprBuilderOptions &Opts, InstContext &IC,
                            ExprBuilderContext &EBC,
                            FunctionCandidateSet &Result) {
@@ -956,10 +970,6 @@ void ExtractExprCandidates(Function &F, const LoopInfo *LI, DemandedBits *DB,
   for (auto &BB : F) {
     std::unique_ptr<BlockCandidateSet> BCS(new BlockCandidateSet);
     for (auto &I : BB) {
-      // SATURN filter candidates
-      if (Opts.CandidateFilterInstructions &&
-          Opts.CandidateFilterInstructions->contains(&I) == false)
-        continue;
       if (isa<ReturnInst>(I))
         PrintDataflowInfo(F, I, LVI, SE);
 
@@ -976,7 +986,7 @@ void ExtractExprCandidates(Function &F, const LoopInfo *LI, DemandedBits *DB,
           if (AddOp == Instruction::Add) {
             if (auto ConstZeroOp = dyn_cast<ConstantInt>(BO->getOperand(1))) {
               if (ConstZeroOp->isZero()) {
-                APInt DemandedBitsVal = DB->getDemandedBits(&I);
+                APInt DemandedBitsVal = DB.getDemandedBits(&I);
                 llvm::outs() << "demanded-bits from compiler for "
                              << I.getName() << " : "
                              << Inst::getDemandedBitsString(DemandedBitsVal)
@@ -1001,7 +1011,8 @@ void ExtractExprCandidates(Function &F, const LoopInfo *LI, DemandedBits *DB,
                 Inst *In = EB.getFromUse(U);
                 In->HarvestKind = HarvestType::HarvestedFromUse;
                 In->HarvestFrom = &BB;
-                EB.markExternalUses(In);
+                if (MarkExternalUses)
+                  EB.markExternalUses(In);
                 BCS->Replacements.emplace_back(U, InstMapping(In, 0));
                 assert(EB.get(U)->hasOrigin(U));
               }
@@ -1017,14 +1028,15 @@ void ExtractExprCandidates(Function &F, const LoopInfo *LI, DemandedBits *DB,
         continue;
       Inst *In;
       if (HarvestDataFlowFacts) {
-        APInt DemandedBits = DB->getDemandedBits(&I);
+        APInt DemandedBits = DB.getDemandedBits(&I);
         In = EB.get(&I, DemandedBits);
       } else {
         In = EB.get(&I);
       }
       In->HarvestKind = HarvestType::HarvestedFromDef;
       In->HarvestFrom = nullptr;
-      EB.markExternalUses(In);
+      if (MarkExternalUses)
+        EB.markExternalUses(In);
       BCS->Replacements.emplace_back(&I, InstMapping(In, 0));
       assert(EB.get(&I)->K == Inst::Const || EB.get(&I)->hasOrigin(&I));
     }
@@ -1046,8 +1058,7 @@ void ExtractExprCandidates(Function &F, const LoopInfo *LI, DemandedBits *DB,
   }
 }
 
-class ExtractExprCandidatesPass : public FunctionPass {
-  static char ID;
+struct ExtractExprCandidatesPass : PassInfoMixin<ExtractExprCandidatesPass> {
   const ExprBuilderOptions &Opts;
   InstContext &IC;
   ExprBuilderContext &EBC;
@@ -1057,60 +1068,39 @@ public:
  ExtractExprCandidatesPass(const ExprBuilderOptions &Opts, InstContext &IC,
                            ExprBuilderContext &EBC,
                            FunctionCandidateSet &Result)
-     : FunctionPass(ID), Opts(Opts), IC(IC), EBC(EBC), Result(Result) {}
+     : Opts(Opts), IC(IC), EBC(EBC), Result(Result) {}
 
-  void getAnalysisUsage(AnalysisUsage &Info) const {
-    Info.addRequired<LoopInfoWrapperPass>();
-    Info.addRequired<DemandedBitsWrapperPass>();
-    Info.addRequired<TargetLibraryInfoWrapperPass>();
-    Info.addRequired<LazyValueInfoWrapperPass>();
-    Info.addRequired<ScalarEvolutionWrapperPass>();
-    Info.setPreservesAll();
-  }
-
-  bool runOnFunction(Function &F) {
-    TargetLibraryInfo* TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(F);
-    LoopInfo *LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-    if (!LI)
-      report_fatal_error("getLoopInfo() failed");
-    DemandedBits *DB = &getAnalysis<DemandedBitsWrapperPass>().getDemandedBits();
-    if (!DB)
-      report_fatal_error("getDemandedBits() failed");
-    LazyValueInfo *LVI = &getAnalysis<LazyValueInfoWrapperPass>().getLVI();
-    if (!LVI)
-      report_fatal_error("getLVI() failed");
-    ScalarEvolution *SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-    if (!SE)
-      report_fatal_error("getSE() failed");
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    TargetLibraryInfo &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
+    LoopInfo &LI = FAM.getResult<LoopAnalysis>(F);
+    DemandedBits &DB = FAM.getResult<DemandedBitsAnalysis>(F);
+    LazyValueInfo &LVI = FAM.getResult<LazyValueAnalysis>(F);
+    ScalarEvolution &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
     ExtractExprCandidates(F, LI, DB, LVI, SE, TLI, Opts, IC, EBC, Result);
-    return false;
+    return PreservedAnalyses::none();
   }
 };
-
-char ExtractExprCandidatesPass::ID = 0;
 
 }
 
 FunctionCandidateSet souper::ExtractCandidatesFromPass(
-    Function *F, const LoopInfo *LI, DemandedBits *DB, LazyValueInfo *LVI,
-    ScalarEvolution *SE, TargetLibraryInfo *TLI, InstContext &IC,
+    Function &F, const LoopInfo &LI, DemandedBits &DB, LazyValueInfo &LVI,
+    ScalarEvolution &SE, TargetLibraryInfo &TLI, InstContext &IC,
     ExprBuilderContext &EBC, const ExprBuilderOptions &Opts) {
   FunctionCandidateSet Result;
-  ExtractExprCandidates(*F, LI, DB, LVI, SE, TLI, Opts, IC, EBC, Result);
+  ExtractExprCandidates(F, LI, DB, LVI, SE, TLI, Opts, IC, EBC, Result);
   return Result;
 }
 
-FunctionCandidateSet souper::ExtractCandidates(Function *F, InstContext &IC,
+FunctionCandidateSet souper::ExtractCandidates(Function &F, InstContext &IC,
                                                ExprBuilderContext &EBC,
                                                const ExprBuilderOptions &Opts) {
+  PassBuilder PB;
+  FunctionAnalysisManager FAM;
+  PB.registerFunctionAnalyses(FAM);
   FunctionCandidateSet Result;
-
-  PassRegistry &Registry = *PassRegistry::getPassRegistry();
-  initializeAnalysis(Registry);
-
-  legacy::FunctionPassManager FPM(F->getParent());
-  FPM.add(new ExtractExprCandidatesPass(Opts, IC, EBC, Result));
-  FPM.run(*F);
-
+  FunctionPassManager FPM;
+  FPM.addPass(ExtractExprCandidatesPass(Opts, IC, EBC, Result));
+  FPM.run(F, FAM);
   return Result;
 }

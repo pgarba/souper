@@ -302,7 +302,7 @@ public:
       *MB = MemoryBuffer::getMemBufferCopy(Output);
 #endif
       
-      if ((*MB)->getBuffer().startswith("sat\n")) {
+      if ((*MB)->getBuffer().starts_with("sat\n")) {
         ::remove(OutputPath.c_str());
         Result = true;
         ++Sats;
@@ -314,7 +314,7 @@ public:
         if (!ErrStr.empty())
           return std::make_error_code(std::errc::protocol_error);
         return std::error_code();
-      } else if ((*MB)->getBuffer().startswith("unsat\n")) {
+      } else if ((*MB)->getBuffer().starts_with("unsat\n")) {
         ::remove(OutputPath.c_str());
         Result = false;
         ++Unsats;

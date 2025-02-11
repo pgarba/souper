@@ -26,16 +26,15 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
-#include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
-#include "llvm/IR/LegacyPassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/PassPlugin.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/DCE.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 #include "souper/KVStore/KVStore.h"
@@ -46,7 +45,6 @@
 #include "set"
 
 #define DEBUG_TYPE "souper"
-
 STATISTIC(InstructionReplaced, "Number of instructions replaced by another instruction");
 STATISTIC(DominanceCheckFailed, "Number of failed replacement due to dominance check");
 
@@ -57,7 +55,7 @@ unsigned DebugLevel;
 
 namespace {
 std::unique_ptr<Solver> S;
-  unsigned ReplacementIdx, ReplacementsDone, LHSNum;
+unsigned ReplacementIdx, ReplacementsDone, LHSNum;
 KVStore *KV;
 
 static cl::opt<unsigned, /*ExternalStorage=*/true>
@@ -90,7 +88,16 @@ static const bool DynamicProfileAll = true;
 static const bool DynamicProfileAll = false;
 #endif
 
-struct SouperPass : public FunctionPass {
+static void eliminateDeadCode(Function &F) {
+  FunctionPassManager FPM;
+  FPM.addPass(DCEPass());
+  FunctionAnalysisManager FAM;
+  FAM.registerPass([&] { return TargetLibraryAnalysis(); });
+  FAM.registerPass([&] { return PassInstrumentationAnalysis(); });
+  FPM.run(F, FAM);
+}
+
+struct SouperPass : PassInfoMixin<SouperPass> {
   static char ID;
 
   Value* getOperand(Inst* I, unsigned index, Instruction *ReplacedInst,
@@ -109,23 +116,6 @@ struct SouperPass : public FunctionPass {
   }
 
 public:
-  SouperPass() : FunctionPass(ID) {
-    if (!S) {
-      S = GetSolver(KV);
-      if (StaticProfile && !KV)
-        KV = new KVStore;
-    }
-  }
-
-  void getAnalysisUsage(AnalysisUsage &Info) const {
-    Info.addRequired<LoopInfoWrapperPass>();
-    Info.addRequired<DominatorTreeWrapperPass>();
-    Info.addRequired<DemandedBitsWrapperPass>();
-    Info.addRequired<LazyValueInfoWrapperPass>();
-    Info.addRequired<ScalarEvolutionWrapperPass>();
-    Info.addRequired<TargetLibraryInfoWrapperPass>();
-  }
-
   void dynamicProfile(Function *F, CandidateReplacement &Cand) {
     std::string Str;
     llvm::raw_string_ostream Loc(Str);
@@ -138,9 +128,9 @@ public:
     Function *RegisterFunc = M->getFunction("_souper_profile_register");
     if (!RegisterFunc) {
       Type *RegisterArgs[] = {
-        PointerType::getInt8PtrTy(C),
-        PointerType::getInt8PtrTy(C),
-        PointerType::getInt64PtrTy(C),
+        PointerType::get(Type::getInt8Ty(C), 0),
+        PointerType::get(Type::getInt8Ty(C), 0),
+        PointerType::get(Type::getInt64Ty(C), 0),
       };
       FunctionType *RegisterType = FunctionType::get(Type::getVoidTy(C),
                                                      RegisterArgs, false);
@@ -153,7 +143,7 @@ public:
     Constant *ReplVar = new GlobalVariable(*M, Repl->getType(), true,
         GlobalValue::PrivateLinkage, Repl, "");
     Constant *ReplPtr = ConstantExpr::getPointerCast(ReplVar,
-        PointerType::getInt8PtrTy(C));
+        PointerType::get(Type::getInt8Ty(C), 0));
 
     Constant *Field = ConstantDataArray::getString(C, "dprofile " + Loc.str(),
                                                    true);
@@ -161,7 +151,7 @@ public:
                                             GlobalValue::PrivateLinkage, Field,
                                             "");
     Constant *FieldPtr = ConstantExpr::getPointerCast(FieldVar,
-        PointerType::getInt8PtrTy(C));
+        PointerType::get(Type::getInt8Ty(C), 0));
 
     Constant *CntVar = new GlobalVariable(*M, Type::getInt64Ty(C), false,
                                           GlobalValue::PrivateLinkage,
@@ -200,58 +190,45 @@ public:
         .getValue(I);
   }
 
-  bool runOnFunction(Function &FRef) override {
-    if (FRef.isDeclaration()) return false;
-
-    auto F = &FRef;
-    if (Verify && verifyFunction(*F))
-      llvm::report_fatal_error("function " + F->getName() + " broken before Souper");
-
+  bool runOnFunction(Function &F, FunctionAnalysisManager &FAM) {
     std::string FunctionName;
-    if (F->hasLocalLinkage()) {
+    if (F.hasLocalLinkage()) {
       FunctionName =
-        (F->getParent()->getModuleIdentifier() + ":" + F->getName()).str();
+        (F.getParent()->getModuleIdentifier() + ":" + F.getName()).str();
     } else {
-      FunctionName = F->getName();
+      FunctionName = F.getName();
     }
 
     if (DebugLevel > 1) {
       errs() << "\n";
       errs() << "; entering Souper's runOnFunction() for " << FunctionName << "()\n\n";
-      F->getParent()->dump();
+      F.getParent()->dump();
       errs() << "\n";
     }
+
+    auto &LI = FAM.getResult<llvm::LoopAnalysis>(F);
+    auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
+    auto &DB = FAM.getResult<DemandedBitsAnalysis>(F);
+    auto &LVI = FAM.getResult<LazyValueAnalysis>(F);
+    auto &SE = FAM.getResult<ScalarEvolutionAnalysis>(F);
+    auto &TLI = FAM.getResult<TargetLibraryAnalysis>(F);
 
     InstContext IC;
     ExprBuilderContext EBC;
     std::map<Inst *, Value *> ReplacedValues;
-    LoopInfo *LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
-    if (!LI)
-      report_fatal_error("getLoopInfo() failed");
-    auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-    DemandedBits *DB = &getAnalysis<DemandedBitsWrapperPass>().getDemandedBits();
-    if (!DB)
-      report_fatal_error("getDemandedBits() failed");
-    LazyValueInfo *LVI = &getAnalysis<LazyValueInfoWrapperPass>().getLVI();
-    if (!LVI)
-      report_fatal_error("getLVI() failed");
-    ScalarEvolution *SE = &getAnalysis<ScalarEvolutionWrapperPass>().getSE();
-    if (!SE)
-      report_fatal_error("getSE() failed");
-    TargetLibraryInfo* TLI = &getAnalysis<TargetLibraryInfoWrapperPass>().getTLI(*F);
-    if (!TLI)
-      report_fatal_error("getTLI() failed");
 
     // Run UnreachableBlockElim and ADCE locally
     // TODO: In the long run, switch this tool to the new pass manager.
-    FunctionPassManager FM;
-    FunctionAnalysisManager FAM;
-    FAM.registerPass([&] { return PassInstrumentationAnalysis(); });
-    FAM.registerPass([&] { return DominatorTreeAnalysis(); });
-    FAM.registerPass([&] { return PostDominatorTreeAnalysis(); });
-    FM.addPass(UnreachableBlockElimPass());
-    FM.addPass(ADCEPass());
-    FM.run(*F, FAM);
+    {
+      FunctionPassManager FM2;
+      FunctionAnalysisManager FAM2;
+      FAM2.registerPass([&] { return PassInstrumentationAnalysis(); });
+      FAM2.registerPass([&] { return DominatorTreeAnalysis(); });
+      FAM2.registerPass([&] { return PostDominatorTreeAnalysis(); });
+      FM2.addPass(UnreachableBlockElimPass());
+      FM2.addPass(ADCEPass());
+      FM2.run(F, FAM2);
+    }
 
     FunctionCandidateSet CS = ExtractCandidatesFromPass(F, LI, DB, LVI, SE, TLI, IC, EBC);
 
@@ -287,7 +264,7 @@ public:
                                             Context), HField, 1);
       }
       if (DynamicProfileAll) {
-        dynamicProfile(F, Cand);
+        dynamicProfile(&F, Cand);
         continue;
       }
       std::vector<Inst *> RHSs;
@@ -322,7 +299,7 @@ public:
       IRBuilder<> Builder(I);
 
       Value *NewVal = getValue(Cand.Mapping.RHS, I, EBC, DT,
-                               ReplacedValues, Builder, F->getParent());
+                               ReplacedValues, Builder, F.getParent());
 
       // if LHS comes from use, then NewVal should be a constant
       assert(Cand.Mapping.LHS->HarvestKind != HarvestType::HarvestedFromUse ||
@@ -355,10 +332,10 @@ public:
         if (DebugLevel > 2) {
           if (DebugLevel > 4) {
             errs() << "\nModule before replacement:\n";
-            F->getParent()->dump();
+            F.getParent()->dump();
           } else {
             errs() << "\nFunction before replacement:\n";
-            F->print(errs());
+            F.print(errs());
           }
         }
         errs() << "\n";
@@ -376,7 +353,7 @@ public:
       }
 
       if (DynamicProfile)
-        dynamicProfile(F, Cand);
+        dynamicProfile(&F, Cand);
 
       if (Cand.Mapping.LHS->HarvestKind == HarvestType::HarvestedFromDef) {
         I->replaceAllUsesWith(NewVal);
@@ -393,15 +370,15 @@ public:
         }
       }
 
-      // eliminateDeadCode(*F, TLI);
+      eliminateDeadCode(F);
 
       if (DebugLevel > 2) {
         if (DebugLevel > 4) {
           errs() << "\nModule after replacement:\n";
-          F->getParent()->dump();
+          F.getParent()->dump();
         } else {
           errs() << "\nFunction after replacement:\n\n";
-          F->print(errs());
+          F.print(errs());
         }
         errs() << "\n";
       }
@@ -414,49 +391,65 @@ public:
 
     return false;
   }
+  
+  PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
+    if (!S) {
+      S = GetSolver(KV);
+      if (StaticProfile && !KV)
+        KV = new KVStore;
+    }
+
+    if (Verify && verifyFunction(F))
+      llvm::report_fatal_error(("function " + F.getName() + " broken before Souper").str().c_str());
+
+    bool res;
+    do {
+      res = runOnFunction(F, FAM);
+      if (res && verifyFunction(F))
+        llvm::report_fatal_error("function broken after Souper changed it");
+    } while (res);
+    
+    return PreservedAnalyses::none();
+  }
+
 };
 
-char SouperPass::ID = 0;
 }
 
 namespace llvm {
-void initializeSouperPassPass(llvm::PassRegistry &);
+  void initializeSouperPass(llvm::PassRegistry &);
 }
 
-INITIALIZE_PASS_BEGIN(SouperPass, "souper", "Souper super-optimizer pass",
-                      false, false)
-INITIALIZE_PASS_DEPENDENCY(LoopInfoWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(DominatorTreeWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(TargetLibraryInfoWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(DemandedBitsWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(LazyValueInfoWrapperPass)
-INITIALIZE_PASS_DEPENDENCY(ScalarEvolutionWrapperPass)
-INITIALIZE_PASS_END(SouperPass, "souper", "Souper super-optimizer pass", false,
-                    false)
+char SouperPass::ID = 0;
 
-static struct Register {
-  Register() {
-    initializeSouperPassPass(*llvm::PassRegistry::getPassRegistry());
+bool pipelineParsingCallback(StringRef Name, FunctionPassManager &FPM,
+                             ArrayRef<PassBuilder::PipelineElement>) {
+  if (Name == "souper") {
+    FPM.addPass(SouperPass());
+    return true;
+  } else {
+    return false;
   }
-} X;
-
-static void registerSouperPass(
-    const llvm::PassManagerBuilder &Builder, llvm::legacy::PassManagerBase &PM) {
-  PM.add(new SouperPass);
 }
 
-void addSouperPass(
-    llvm::legacy::PassManagerBase &PM) {
-  PM.add(new SouperPass);
+void passBuilderCallback(PassBuilder &PB) {
+  PB.registerPipelineParsingCallback(pipelineParsingCallback);
+  // FIXME: use EP_OptimizerLast to support dynamic profiling
+  PB.registerPeepholeEPCallback(
+        [](llvm::FunctionPassManager &FPM, llvm::OptimizationLevel Level) {
+        FPM.addPass(SouperPass());
+      });
 }
 
-/*
-static llvm::RegisterStandardPasses
-#ifdef DYNAMIC_PROFILE_ALL
-RegisterSouperOptimizer(llvm::PassManagerBuilder::EP_OptimizerLast,
-                        registerSouperPass);
-#else
-RegisterSouperOptimizer(llvm::PassManagerBuilder::EP_Peephole,
-                        registerSouperPass);
-#endif
-*/
+PassPluginLibraryInfo getSouperPassPluginInfo() {
+  llvm::PassPluginLibraryInfo Res;
+  Res.APIVersion = LLVM_PLUGIN_API_VERSION;
+  Res.PluginName = "souper";
+  Res.PluginVersion = LLVM_VERSION_STRING;
+  Res.RegisterPassBuilderCallbacks = passBuilderCallback;
+  return Res;
+}
+
+extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
+  return getSouperPassPluginInfo();
+}

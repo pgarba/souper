@@ -34,7 +34,7 @@ void souper::AddToCandidateMap(CandidateMap &M,
 void souper::AddModuleToCandidateMap(InstContext &IC, ExprBuilderContext &EBC,
                                      CandidateMap &CandMap, llvm::Module *M) {
   for (auto &F : *M) {
-    FunctionCandidateSet CS = ExtractCandidates(&F, IC, EBC);
+    FunctionCandidateSet CS = ExtractCandidates(F, IC, EBC);
     for (auto &B : CS.Blocks) {
       for (auto &R : B->Replacements) {
         AddToCandidateMap(CandMap, R);

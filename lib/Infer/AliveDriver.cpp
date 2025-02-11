@@ -15,6 +15,7 @@
 #include "alive2/util/errors.h"
 #include "alive2/util/symexec.h"
 
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/CommandLine.h"
 
@@ -161,7 +162,10 @@ private:
   }
 
   IR::Value *toValue(IR::Type &t, llvm::APInt x) {
-    auto c = std::make_unique<IR::IntConst>(t, toString(x, 10, false));
+    llvm::SmallString<64> S;
+    x.toStringUnsigned(S);
+    std::string Str(S);
+    auto c = std::make_unique<IR::IntConst>(t, std::move(Str));
     auto ptr = c.get();
     F.addConstant(std::move(c));
     return ptr;
@@ -722,7 +726,7 @@ souper::AliveDriver::translateDemandedBits(const souper::Inst* I,
 
   assert(DemandedBits.getBitWidth() == I-> Width && "Uninitialized DemandedBits");
 
-  if (!DemandedBits.isAllOnesValue()) {
+  if (!DemandedBits.isAllOnes()) {
     auto DBMask = Builder.val(getType(I->Width), DemandedBits);
 
     ExprCache[I] = Builder.binOp(getType(I->Width),
